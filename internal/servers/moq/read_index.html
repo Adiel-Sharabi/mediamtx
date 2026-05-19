@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<style>
+html, body {
+	margin: 0;
+	padding: 0;
+	height: 100%;
+	font-family: 'Arial', sans-serif;
+}
+#video {
+	position: absolute;
+	top: 0;
+	left: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: contain;
+	background: #000;
+	display: block;
+}
+#message {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	display: flex;
+	align-items: center;
+	text-align: center;
+	justify-content: center;
+	font-size: 16px;
+	font-weight: bold;
+	color: white;
+	pointer-events: none;
+	padding: 20px;
+	box-sizing: border-box;
+	text-shadow: 0 0 5px black;
+}
+</style>
+</head>
+<body>
+
+<canvas id="video"></canvas>
+<div id="message"></div>
+
+<script>
+
+// ──────────────────────────── varint / framing ────────────────────────────
+
+const encodeVarint = (value) => {
+    const v = BigInt(value);
+    if (v < 128n) {
+        return new Uint8Array([Number(v)]);
+    }
+    if (v < 16384n) {
+        return new Uint8Array([0x80 | Number(v >> 8n), Number(v & 0xFFn)]);
+    }
+    if (v < 2097152n) {
+        return new Uint8Array([0xC0 | Number(v >> 16n), Number((v >> 8n) & 0xFFn), Number(v & 0xFFn)]);
+    }
+    if (v < 268435456n) {
+        return new Uint8Array([0xE0 | Number(v >> 24n), Number((v >> 16n) & 0xFFn), Number((v >> 8n) & 0xFFn), Number(v & 0xFFn)]);
+    }
+    throw new Error('varint too large: ' + value);
+};
+
+const concat = (...arrays) => {
+    const total = arrays.reduce((n, a) => n + a.length, 0);
+    const out = new Uint8Array(total);
+    let pos = 0;
+    for (const a of arrays) { out.set(a, pos); pos += a.length; }
+    return out;
+};
+
+const encodeString = (s) => { const b = new TextEncoder().encode(s); return concat(encodeVarint(b.length), b); };
+const encodeNamespace = (parts) => { let b = encodeVarint(parts.length); for (const p of parts) b = concat(b, encodeString(p)); return b; };
+const encodeMsg = (type, payload) => concat(encodeVarint(type), new Uint8Array([(payload.length >> 8) & 0xFF, payload.length & 0xFF]), payload);
+
+// ──────────────────────────── StreamReader ────────────────────────────────
+
+class StreamReader {
+    #reader = null;
+    #buf = new Uint8Array(0);
+
+    constructor(src) {
+        if (src instanceof Uint8Array) {
+            this.#buf = src;
+        } else {
+            this.#reader = src.getReader();
+        }
+    }
+
+    async #fill() {
+        if (!this.#reader) {
+            throw new Error('stream ended');
+        }
+        const { value, done } = await this.#reader.read();
+        if (done) {
+            throw new Error('stream ended');
+        }
+        const next = new Uint8Array(this.#buf.length + value.length);
+        next.set(this.#buf); next.set(value, this.#buf.length);
+        this.#buf = next;
+    }
+
+    async readBytes(n) {
+        while (this.#buf.length < n) await this.#fill();
+        const out = this.#buf.slice(0, n);
+        this.#buf = this.#buf.slice(n);
+        return out;
+    }
+
+    async readVarint() {
+        while (this.#buf.length < 1) await this.#fill();
+        const b = this.#buf[0];
+        let size;
+        if ((b & 0x80) === 0) {
+            size = 1;
+        } else if ((b & 0xC0) === 0x80) {
+            size = 2;
+        } else if ((b & 0xE0) === 0xC0) {
+            size = 3;
+        } else if ((b & 0xF0) === 0xE0) {
+            size = 4;
+        } else if ((b & 0xF8) === 0xF0) {
+            size = 5;
+        } else {
+            throw new Error('unsupported varint: 0x' + b.toString(16));
+        }
+        const d = await this.readBytes(size);
+        switch (size) {
+            case 1: return BigInt(d[0]);
+            case 2: return BigInt((d[0] & 0x3F) << 8 | d[1]);
+            case 3: return BigInt((d[0] & 0x1F) << 16 | d[1] << 8 | d[2]);
+            case 4: return BigInt((d[0] & 0x0F) << 24 | d[1] << 16 | d[2] << 8 | d[3]);
+            case 5: return (BigInt(d[0] & 0x07) << 32n) | (BigInt(d[1]) << 24n) | (BigInt(d[2]) << 16n) | (BigInt(d[3]) << 8n) | BigInt(d[4]);
+        }
+    }
+
+    async readU16() { const d = await this.readBytes(2); return (d[0] << 8) | d[1]; }
+}
+
+// ──────────────────────────── codec helpers ───────────────────────────────
+
+function isKeyFrame(codec, data) {
+    if (codec.startsWith('avc1')) {
+        // AVCC: scan length-prefixed NALUs for IDR (type 5)
+        let i = 0;
+        while (i + 4 <= data.length) {
+            const len = ((data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3]) >>> 0;
+            i += 4;
+            if (i < data.length && (data[i] & 0x1F) === 5) {
+                return true;
+            }
+            i += len;
+        }
+        return false;
+    }
+    if (codec.startsWith('hvc1')) {
+        // HEVC: NAL type in bits [9:15] of the 2-byte NAL header
+        let i = 0;
+        while (i + 4 <= data.length) {
+            const len = ((data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3]) >>> 0;
+            i += 4;
+            if (i < data.length) {
+                const nalType = (data[i] >> 1) & 0x3F;
+                if (nalType >= 16 && nalType <= 23) {
+                    return true; // IRAP
+                }
+            }
+            i += len;
+        }
+        return false;
+    }
+    return true; // assume key for AV1/VP9/VP8
+}
+
+function base64ToBuffer(b64) {
+    const bin = atob(b64);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+    return buf.buffer;
+}
+
+function bytesEqual(a, b) {
+    if (a.length !== b.length) {
+        return false;
+    }
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function buildAvcC(spsNalus, ppsNalus) {
+    const sps = spsNalus[0];
+    const parts = [
+        new Uint8Array([1, sps[1], sps[2], sps[3], 0xFF]),
+        new Uint8Array([0xE0 | spsNalus.length]),
+    ];
+    for (const s of spsNalus) { parts.push(new Uint8Array([(s.length >> 8) & 0xFF, s.length & 0xFF])); parts.push(s); }
+    parts.push(new Uint8Array([ppsNalus.length]));
+    for (const p of ppsNalus) { parts.push(new Uint8Array([(p.length >> 8) & 0xFF, p.length & 0xFF])); parts.push(p); }
+    return concat(...parts);
+}
+
+function buildHvcC(vpsNalus, spsNalus, ppsNalus) {
+    const hdr = new Uint8Array(23);
+    hdr[0] = 1;     // configurationVersion
+    hdr[13] = 0xF0; // reserved
+    hdr[15] = 0xFC; // reserved | parallelismType=0
+    hdr[16] = 0xFC; // reserved | chroma_format_idc=0
+    hdr[17] = 0xF8; // reserved | bit_depth_luma_minus8=0
+    hdr[18] = 0xF8; // reserved | bit_depth_chroma_minus8=0
+    hdr[21] = 0x03; // lengthSizeMinusOne=3
+    const arrays = [];
+    const addArray = (type, nalus) => {
+        if (!nalus.length) {
+            return;
+        }
+        const parts = [new Uint8Array([0x80 | type, 0x00, nalus.length])];
+        for (const n of nalus) { parts.push(new Uint8Array([(n.length >> 8) & 0xFF, n.length & 0xFF])); parts.push(n); }
+        arrays.push(concat(...parts));
+    };
+    addArray(32, vpsNalus); addArray(33, spsNalus); addArray(34, ppsNalus);
+    hdr[22] = arrays.length;
+    return concat(hdr, ...arrays);
+}
+
+function extractInStreamParams(codec, data) {
+    if (codec.startsWith('avc1') || codec.startsWith('avc3')) {
+        const sps = [], pps = [];
+        let i = 0;
+        while (i + 4 <= data.length) {
+            const len = ((data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3]) >>> 0;
+            i += 4;
+            if (i + len > data.length) {
+                break;
+            }
+            const t = data[i] & 0x1F;
+            if (t === 7) {
+                sps.push(data.slice(i, i + len));
+            } else if (t === 8) {
+                pps.push(data.slice(i, i + len));
+            }
+            i += len;
+        }
+        return (sps.length && pps.length) ? buildAvcC(sps, pps) : null;
+    }
+    if (codec.startsWith('hvc1') || codec.startsWith('hev1')) {
+        const vps = [], sps = [], pps = [];
+        let i = 0;
+        while (i + 4 <= data.length) {
+            const len = ((data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3]) >>> 0;
+            i += 4;
+            if (i + len > data.length) {
+                break;
+            }
+            const t = (data[i] >> 1) & 0x3F;
+            if (t === 32) {
+                vps.push(data.slice(i, i + len));
+            } else if (t === 33) {
+                sps.push(data.slice(i, i + len));
+            } else if (t === 34) {
+                pps.push(data.slice(i, i + len));
+            }
+            i += len;
+        }
+        return sps.length ? buildHvcC(vps, sps, pps) : null;
+    }
+    return null;
+}
+
+// ──────────────────────────── MoQPlayer ──────────────────────────────────
+
+const MOQT_VERSION  = 'moqt-18';
+
+const SETUP_TYPE    = 0x2F00n;
+const MSG_SUBSCRIBE = 0x03n;
+const MSG_SUBSCRIBE_OK = 0x04n;
+const SUBGROUP_TYPE = 0x30n;
+
+class MoQPlayer {
+    #wt = null;
+    #namespace = [];
+    #fingerprint = null;
+    #catalog = null;
+    #decoders = new Map();   // trackAlias (BigInt) → {type, decoder, seenKey} or audio entry with sched
+    #audioCtx = null;
+    #uniQueue = [];          // buffered incoming uni streams
+    #uniWaiters = [];        // pending resolvers
+
+    constructor() {
+        this.#namespace = window.location.pathname.replace(/^\/|\/$/g, '').split('/').filter(Boolean);
+        this.#run()
+    }
+
+    #run() {
+        this.#fetchFingerprint()
+            .then(() => this.#connect())
+            .then(() => this.#setup())
+            .then(() => this.#subscribeCatalog())
+            .then(() => this.#subscribeAllTracks())
+            .then(() => this.#drainDataStreams())
+            .catch((err) => this.#handleError(err));
+    }
+
+    #handleError(err) {
+        if (this.#wt) {
+            this.#wt.close();
+            this.#wt = null;
+        }
+
+        const msg = document.getElementById('message');
+        msg.innerText = err.message;
+    }
+
+    async #fetchFingerprint() {
+        const hex = await fetch('fingerprint').then(r => r.text());
+        this.#fingerprint = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < this.#fingerprint.length; i++)
+            this.#fingerprint[i] = parseInt(hex.slice(2*i, 2*i+2), 16);
+    }
+
+    async #connect() {
+        this.#wt = new WebTransport(
+            new URL('moq', window.location.href) + window.location.search,
+            {
+                serverCertificateHashes: [{ algorithm: 'sha-256', value: this.#fingerprint.buffer }],
+                protocols: [MOQT_VERSION],
+            }
+        );
+        await this.#wt.ready;
+        console.log('connected');
+
+        this.#wt.closed.then(() => console.log('connection closed'));
+
+        this.#acceptUniStreams()
+            .catch((err) => this.#handleError(err));
+    }
+
+    async #acceptUniStreams() {
+        const reader = this.#wt.incomingUnidirectionalStreams.getReader();
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) {
+                break;
+            }
+            if (this.#uniWaiters.length > 0) {
+                this.#uniWaiters.shift()(value);
+            } else {
+                this.#uniQueue.push(value);
+            }
+        }
+    }
+
+    #nextUni() {
+        return new Promise(resolve => {
+            if (this.#uniQueue.length > 0) {
+                resolve(this.#uniQueue.shift());
+            } else {
+                this.#uniWaiters.push(resolve);
+            }
+        });
+    }
+
+    async #setup() {
+        const tx = await this.#wt.createUnidirectionalStream();
+        const w = tx.getWriter();
+        await w.write(encodeVarint(SETUP_TYPE));
+        await w.write(new Uint8Array([0x00, 0x00]));
+        w.releaseLock();
+
+        const rx = new StreamReader(await this.#nextUni());
+        const t = await rx.readVarint();
+        if (t !== SETUP_TYPE) {
+            throw new Error('unexpected setup type 0x' + t.toString(16));
+        }
+        await rx.readBytes(await rx.readU16());
+        console.log('setup ok');
+    }
+
+    async #subscribeCatalog() {
+        const bidi = await this.#wt.createBidirectionalStream();
+        const w = bidi.writable.getWriter();
+        const r = new StreamReader(bidi.readable);
+
+        await w.write(encodeMsg(MSG_SUBSCRIBE, concat(
+            encodeVarint(0),
+            encodeNamespace(this.#namespace),
+            encodeString('.catalog'),
+            encodeVarint(0),
+        )));
+        w.releaseLock();
+
+        const t = await r.readVarint();
+        if (t !== MSG_SUBSCRIBE_OK) {
+            throw new Error('expected SUBSCRIBE_OK, got 0x' + t.toString(16));
+        }
+        await r.readBytes(await r.readU16());
+
+        const payload = await this.#readSubgroupPayload(await this.#nextUni());
+        this.#catalog = JSON.parse(new TextDecoder().decode(payload));
+
+        console.log('catalog: ' + this.#catalog.tracks.map(t => t.name + '=' + t.codec).join(', '));
+    }
+
+    async #readSubgroupPayload(readable) {
+        const r = new StreamReader(readable);
+        if (await r.readVarint() !== SUBGROUP_TYPE) {
+            throw new Error('not a subgroup stream');
+        }
+        await r.readVarint(); // trackAlias
+        await r.readVarint(); // groupId
+        const chunks = [];
+        for (;;) {
+            await r.readVarint(); // idDelta
+            const len = await r.readVarint();
+            if (len === 0n) {
+                break;
+            }
+            chunks.push(await r.readBytes(Number(len)));
+        }
+        return concat(...chunks);
+    }
+
+    async #subscribeAllTracks() {
+        const selected = [];
+        let hasVideo = false, hasAudio = false;
+        for (let i = 0; i < this.#catalog.tracks.length; i++) {
+            const track = this.#catalog.tracks[i];
+            const isVideo = /^(avc1|hvc1|av01|vp09|vp8)/.test(track.codec);
+            if (isVideo && !hasVideo) {
+                selected.push([i, track]);
+                hasVideo = true;
+            } else if (!isVideo && !hasAudio) {
+                selected.push([i, track]);
+                hasAudio = true;
+            }
+        }
+        await Promise.all(selected.map(([i, track]) => this.#subscribeTrack(i, track)));
+    }
+
+    async #subscribeTrack(i, track) {
+        const requestId = BigInt(i + 1);
+
+        const bidi = await this.#wt.createBidirectionalStream();
+        const w = bidi.writable.getWriter();
+        const r = new StreamReader(bidi.readable);
+
+        await w.write(encodeMsg(MSG_SUBSCRIBE, concat(
+            encodeVarint(requestId),
+            encodeNamespace(this.#namespace),
+            encodeString(track.name),
+            encodeVarint(0),
+        )));
+        w.releaseLock();
+
+        const t = await r.readVarint();
+        if (t !== MSG_SUBSCRIBE_OK) {
+            throw new Error('expected SUBSCRIBE_OK, got 0x' + t.toString(16));
+        }
+        await r.readBytes(await r.readU16());
+
+        this.#setupDecoder(requestId, track);
+        console.log('subscribed track ' + i + ' (' + track.codec + ')');
+    }
+
+    #setupDecoder(alias, track) {
+        const isVideo = /^(avc1|hvc1|av01|vp09|vp8)/.test(track.codec);
+        if (isVideo) {
+            const canvas = document.getElementById('video');
+            const ctx2d = canvas.getContext('2d');
+
+            const decoder = new VideoDecoder({
+                output: (frame) => {
+                    if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+                        canvas.width = frame.displayWidth;
+                        canvas.height = frame.displayHeight;
+                    }
+                    ctx2d.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                    frame.close();
+                },
+                error: (err) => console.error(err.message),
+            });
+
+            const baseCfg = { codec: track.codec, optimizeForLatency: true };
+
+            let descBytes = null;
+            //if (track.initData) {
+            //    descBytes = new Uint8Array(base64ToBuffer(track.initData));
+            //}
+
+            const needsDesc = /^(avc1|avc3|hvc1|hev1)/.test(track.codec);
+            if (descBytes !== null || !needsDesc) {
+                decoder.configure(descBytes !== null ? { ...baseCfg, description: descBytes.buffer } : baseCfg);
+            }
+
+            this.#decoders.set(alias, { type: 'video', decoder, seenKey: false, codec: track.codec, baseCfg, descBytes, needsDesc });
+
+        } else {
+            if (!this.#audioCtx) {
+                this.#audioCtx = new AudioContext();
+            }
+
+            const clockRate = track.clockrate || 48000;
+            // pts scheduling state: initialized on first frame
+            const sched = { ptsBase: null, audioBase: null, clockRate };
+
+            const decoder = new AudioDecoder({
+                output: (data) => {
+                    try {
+                        const buf = this.#audioCtx.createBuffer(data.numberOfChannels, data.numberOfFrames, data.sampleRate);
+                        for (let ch = 0; ch < data.numberOfChannels; ch++)
+                            data.copyTo(buf.getChannelData(ch), { planeIndex: ch, format: 'f32-planar' });
+                        const src = this.#audioCtx.createBufferSource();
+                        src.buffer = buf;
+                        src.connect(this.#audioCtx.destination);
+                        // data.timestamp is (pts - ptsBase) in microseconds
+                        const when = sched.audioBase + data.timestamp / 1e6;
+                        src.start(Math.max(when, this.#audioCtx.currentTime));
+                    } catch(err) {
+                        console.error(err);
+                    } finally {
+                        data.close();
+                    }
+                },
+                error: (err) => console.error(err),
+            });
+
+            const audioCfg = {
+                codec: track.codec,
+                sampleRate: track.samplerate || 48000,
+                numberOfChannels: track.channels || 2,
+            };
+            if (track.initData) {
+                audioCfg.description = base64ToBuffer(track.initData);
+            }
+            decoder.configure(audioCfg);
+
+            this.#decoders.set(alias, { type: 'audio', decoder, seenKey: true, sched });
+        }
+    }
+
+    async #drainDataStreams() {
+        for (;;) {
+            const stream = await this.#nextUni();
+            this.#handleDataStream(stream)
+                .catch(err => this.#handleError(err));
+        }
+    }
+
+    async #handleDataStream(readable) {
+        const r = new StreamReader(readable);
+        const streamType = await r.readVarint();
+        if (streamType !== SUBGROUP_TYPE) {
+            return;
+        }
+
+        const trackAlias = await r.readVarint();
+        const groupId = await r.readVarint(); // PTS in codec clock ticks
+
+        const entry = this.#decoders.get(trackAlias);
+        if (!entry) {
+            return;
+        }
+
+        const chunks = [];
+        for (;;) {
+            await r.readVarint(); // idDelta
+            const len = await r.readVarint();
+            if (len === 0n) {
+                break;
+            }
+            chunks.push(await r.readBytes(Number(len)));
+        }
+        if (chunks.length === 0) {
+            return;
+        }
+
+        const data = concat(...chunks);
+
+        if (entry.type === 'video') {
+            const key = isKeyFrame(entry.codec, data);
+            if (!entry.seenKey && !key) {
+                return;
+            }
+
+            if (key) {
+                const newDesc = extractInStreamParams(entry.codec, data);
+                if (newDesc !== null && (entry.descBytes === null || !bytesEqual(newDesc, entry.descBytes))) {
+                    entry.descBytes = newDesc;
+                    entry.decoder.configure({ ...entry.baseCfg, description: newDesc.buffer });
+                    console.log('video params updated (' + entry.codec.slice(0, 4) + ')');
+                }
+                if (entry.needsDesc && entry.descBytes === null) {
+                    return;
+                }
+                entry.seenKey = true;
+            }
+
+            const ts = performance.now() * 1000;
+            entry.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data }));
+        } else {
+            const sched = entry.sched;
+            if (sched.ptsBase === null) {
+                sched.ptsBase = groupId;
+                sched.audioBase = this.#audioCtx.currentTime + 0.05; // 50ms initial buffer
+            }
+            // timestamp in microseconds: (pts - ptsBase) / clockRate * 1e6
+            const ts = Number(groupId - sched.ptsBase) * 1e6 / sched.clockRate;
+            entry.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ts, data }));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+
+window.addEventListener('load', () => {
+    new MoQPlayer();
+});
+
+</script>
+
+</body>
+</html>
